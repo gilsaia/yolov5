@@ -942,6 +942,7 @@ def apply_classifier(x, model, img, im0):
 def increment_path(path, exist_ok=False, sep='', mkdir=False):
     # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
     path = Path(path)  # os-agnostic
+    num = 1
     if path.exists() and not exist_ok:
         path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
 
@@ -949,6 +950,7 @@ def increment_path(path, exist_ok=False, sep='', mkdir=False):
         for n in range(2, 9999):
             p = f'{path}{sep}{n}{suffix}'  # increment path
             if not os.path.exists(p):  #
+                num = n
                 break
         path = Path(p)
 
@@ -962,7 +964,7 @@ def increment_path(path, exist_ok=False, sep='', mkdir=False):
     if mkdir:
         path.mkdir(parents=True, exist_ok=True)  # make directory
 
-    return path
+    return path, num
 
 
 # OpenCV Chinese-friendly functions ------------------------------------------------------------------------------------

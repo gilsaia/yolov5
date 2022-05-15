@@ -21,6 +21,7 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from utils.loggers.misc import AverageMeter
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ import yaml
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
+import horovod.torch as hvd
 from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
@@ -44,11 +46,11 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader
+from utils.datasets import create_dataloader
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
-                           check_suffix, check_version, check_yaml, colorstr, get_latest_run, increment_path,
-                           init_seeds, intersect_dicts, labels_to_class_weights, labels_to_image_weights, methods,
+                           check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
+                           intersect_dicts, is_ascii, labels_to_class_weights, labels_to_image_weights, methods,
                            one_cycle, print_args, print_mutation, strip_optimizer)
 from utils.loggers import Loggers
 from utils.loggers.wandb.wandb_utils import check_wandb_resume
@@ -57,9 +59,17 @@ from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
 
-LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
-RANK = int(os.getenv('RANK', -1))
-WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+hvd.init()  # use horovod rank
+LOCAL_RANK = hvd.local_rank() if hvd.size() != 1 else -1
+LOCAL_RANK_FAKE = -1
+RANK = hvd.rank() if hvd.size() != 1 else -1
+WORLD_SIZE = int(hvd.size() / hvd.local_size()) if hvd.size() != 1 else 1
+
+
+# original get rank
+# LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
+# RANK = int(os.getenv('RANK', -1))
+# WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
@@ -103,8 +113,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != 'cpu'
     init_seeds(1 + RANK)
-    with torch_distributed_zero_first(LOCAL_RANK):
-        data_dict = data_dict or check_dataset(data)  # check if None
+    # with torch_distributed_zero_first(LOCAL_RANK):
+    #     data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path = data_dict['train'], data_dict['val']
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
@@ -115,8 +125,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
     if pretrained:
+        # weights = attempt_download(weights)  # download if not found locally
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
+        # hvd.broadcast(torch.ones(1), root_rank=0, name="download_data")
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
@@ -171,6 +183,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     optimizer.add_param_group({'params': g[1]})  # add g1 (BatchNorm2d weights)
     LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__} with parameter groups "
                 f"{len(g[1])} weight (no decay), {len(g[0])} weight, {len(g[2])} bias")
+
+    # horovod optimizer
+    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
+    LOGGER.info(f"{colorstr('optimizer:')}{type(optimizer).__name__}")
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
     del g
 
     # Scheduler
@@ -268,11 +286,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         callbacks.run('on_pretrain_routine_end')
 
     # DDP mode
-    if cuda and RANK != -1:
-        if check_version(torch.__version__, '1.11.0'):
-            model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, static_graph=True)
-        else:
-            model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+    # if cuda and RANK != -1:
+    #     model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
 
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
@@ -301,9 +316,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
+    batch_time_start = time.time()
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
         model.train()
+
+        train_forward_time = AverageMeter("ForwardTime", ":6.3f")
+        train_backward_time = AverageMeter("BackwardTime", ":6.3f")
+        train_opt_time = AverageMeter("OptTime", ":6.3f")
+        train_batch_time = AverageMeter("BatchTime", ":6.3f")
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -348,6 +369,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
+            forward_time_start = time.time()
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
@@ -355,11 +377,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.
+            train_forward_time.update(time.time() - forward_time_start)
 
             # Backward
+            backward_time_start = time.time()
             scaler.scale(loss).backward()
+            train_backward_time.update(time.time() - backward_time_start)
 
             # Optimize
+            opt_time_start = time.time()
             if ni - last_opt_step >= accumulate:
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
@@ -367,6 +393,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
+            train_opt_time.update(time.time() - opt_time_start)
 
             # Log
             if RANK in (-1, 0):
@@ -377,6 +404,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots)
                 if callbacks.stop_training:
                     return
+
+            train_batch_time.update(time.time() - batch_time_start)
+            batch_time_start = time.time()
             # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -404,7 +434,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
+            train_times = [train_forward_time.value(), train_backward_time.value(), train_opt_time.value(),
+                           train_batch_time.value()]
+            log_vals = list(mloss) + list(results) + lr + train_times
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
             # Save model
@@ -445,7 +477,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training -----------------------------------------------------------------------------------------------------
     if RANK in (-1, 0):
-        LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
+        run_time = time.time() - t0
+        LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {run_time / 3600:.3f} hours.')
         for f in last, best:
             if f.exists():
                 strip_optimizer(f)  # strip optimizers
@@ -468,7 +501,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     if is_coco:
                         callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
-        callbacks.run('on_train_end', last, best, plots, epoch, results)
+        callbacks.run('on_train_end', last, best, plots, epoch, results, run_time)
 
     torch.cuda.empty_cache()
     return results
@@ -509,6 +542,10 @@ def parse_opt(known=False):
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+    parser.add_argument("-c", "--compression", action="store_true")
+    parser.add_argument("-co", "--compressor", type=str, default="topk")
+    parser.add_argument("-p", "--pruning", action="store_true")
+    parser.add_argument("-s", "--sparsity", type=float, default=0.5)
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')
@@ -545,9 +582,17 @@ def main(opt, callbacks=Callbacks()):
             opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
         if opt.name == 'cfg':
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
-        opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
-    # DDP mode
+        # Run name
+        if opt.compression:
+            opt.name += '-' + opt.compressor
+        if opt.pruning:
+            opt.name += '-pruning-' + str(opt.sparsity)
+        save_dir, run_id = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok, sep='-')
+        opt.save_dir = str(save_dir)
+        opt.name += f'-{run_id}'
+
+    # horovod mode
     device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
         msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
@@ -555,10 +600,25 @@ def main(opt, callbacks=Callbacks()):
         assert not opt.evolve, f'--evolve {msg}'
         assert opt.batch_size != -1, f'AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size'
         assert opt.batch_size % WORLD_SIZE == 0, f'--batch-size {opt.batch_size} must be multiple of WORLD_SIZE'
-        assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
-        torch.cuda.set_device(LOCAL_RANK)
-        device = torch.device('cuda', LOCAL_RANK)
-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+        # assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
+        torch.cuda.set_device(0)  # use docker for one gpu each container
+        device = torch.device('cuda', 0)
+        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo",
+                                init_method='file:///home/share/torchfile', world_size=WORLD_SIZE,
+                                rank=LOCAL_RANK)
+
+    # DDP mode
+    # device = select_device(opt.device, batch_size=opt.batch_size)
+    # if LOCAL_RANK != -1:
+    #     msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
+    #     assert not opt.image_weights, f'--image-weights {msg}'
+    #     assert not opt.evolve, f'--evolve {msg}'
+    #     assert opt.batch_size != -1, f'AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size'
+    #     assert opt.batch_size % WORLD_SIZE == 0, f'--batch-size {opt.batch_size} must be multiple of WORLD_SIZE'
+    #     assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
+    #     torch.cuda.set_device(LOCAL_RANK)
+    #     device = torch.device('cuda', LOCAL_RANK)
+    #     dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
 
     # Train
     if not opt.evolve:

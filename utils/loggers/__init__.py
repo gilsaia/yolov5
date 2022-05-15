@@ -55,7 +55,11 @@ class Loggers():
             'val/cls_loss',  # val loss
             'x/lr0',
             'x/lr1',
-            'x/lr2']  # params
+            'x/lr2',
+            'train/forward_time',
+            'train/backward_time',
+            'train/opt_time',
+            'train/batch_time']  # params
         self.best_keys = ['best/epoch', 'best/precision', 'best/recall', 'best/mAP_0.5', 'best/mAP_0.5:0.95']
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
@@ -157,7 +161,7 @@ class Loggers():
             if ((epoch + 1) % self.opt.save_period == 0 and not final_epoch) and self.opt.save_period != -1:
                 self.wandb.log_model(last.parent, self.opt, epoch, fi, best_model=best_fitness == fi)
 
-    def on_train_end(self, last, best, plots, epoch, results):
+    def on_train_end(self, last, best, plots, epoch, results, run_time):
         # Callback runs on training end
         if plots:
             plot_results(file=self.save_dir / 'results.csv')  # save results.png
@@ -172,6 +176,7 @@ class Loggers():
         if self.wandb:
             self.wandb.log(dict(zip(self.keys[3:10], results)))
             self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
+            self.wandb.log({"metrics/run_time": run_time})
             # Calling wandb.log. TODO: Refactor this into WandbLogger.log_model
             if not self.opt.evolve:
                 wandb.log_artifact(str(best if best.exists() else last),
