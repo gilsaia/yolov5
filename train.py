@@ -46,7 +46,7 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.datasets import create_dataloader
+from utils.dataloaders import create_dataloader
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
@@ -79,9 +79,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     callbacks.run('on_pretrain_routine_start')
 
     # Directories
-    w = save_dir / 'weights'  # weights dir
-    (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
-    last, best = w / 'last.pt', w / 'best.pt'
+    if RANK in [-1, 0]:
+        w = save_dir / 'weights'  # weights dir
+        (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
+        last, best = w / 'last.pt', w / 'best.pt'
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -90,7 +91,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
 
     # Save run settings
-    if not evolve:
+    if not evolve and RANK in [-1, 0]:
         with open(save_dir / 'hyp.yaml', 'w') as f:
             yaml.safe_dump(hyp, f, sort_keys=False)
         with open(save_dir / 'opt.yaml', 'w') as f:
@@ -113,8 +114,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != 'cpu'
     init_seeds(1 + RANK)
-    # with torch_distributed_zero_first(LOCAL_RANK):
-    #     data_dict = data_dict or check_dataset(data)  # check if None
+    with torch_distributed_zero_first(LOCAL_RANK_FAKE):
+        data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path = data_dict['train'], data_dict['val']
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
@@ -126,7 +127,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     pretrained = weights.endswith('.pt')
     if pretrained:
         # weights = attempt_download(weights)  # download if not found locally
-        with torch_distributed_zero_first(LOCAL_RANK):
+        with torch_distributed_zero_first(LOCAL_RANK_FAKE):
             weights = attempt_download(weights)  # download if not found locally
         # hvd.broadcast(torch.ones(1), root_rank=0, name="download_data")
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
@@ -386,9 +387,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Optimize
             opt_time_start = time.time()
+            optimizer.synchronize()
             if ni - last_opt_step >= accumulate:
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
+                with optimizer.skip_synchronize():
+                    scaler.step(optimizer)  # optimizer.step
+                    scaler.update()
                 optimizer.zero_grad()
                 if ema:
                     ema.update(model)
@@ -588,7 +591,8 @@ def main(opt, callbacks=Callbacks()):
             opt.name += '-' + opt.compressor
         if opt.pruning:
             opt.name += '-pruning-' + str(opt.sparsity)
-        save_dir, run_id = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok, sep='-')
+        save_dir, run_id = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok, sep='-',
+                                          mkdir=RANK in [-1, 0])
         opt.save_dir = str(save_dir)
         opt.name += f'-{run_id}'
 
@@ -603,9 +607,9 @@ def main(opt, callbacks=Callbacks()):
         # assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
         torch.cuda.set_device(0)  # use docker for one gpu each container
         device = torch.device('cuda', 0)
-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo",
-                                init_method='file:///home/share/torchfile', world_size=WORLD_SIZE,
-                                rank=LOCAL_RANK)
+        # dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo",
+        #                         init_method='file:///home/share/torchfile', world_size=WORLD_SIZE,
+        #                         rank=LOCAL_RANK)
 
     # DDP mode
     # device = select_device(opt.device, batch_size=opt.batch_size)
@@ -625,7 +629,7 @@ def main(opt, callbacks=Callbacks()):
         train(opt.hyp, opt, device, callbacks)
         if WORLD_SIZE > 1 and RANK == 0:
             LOGGER.info('Destroying process group... ')
-            dist.destroy_process_group()
+            # dist.destroy_process_group()
 
     # Evolve hyperparameters (optional)
     else:
