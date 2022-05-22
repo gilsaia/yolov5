@@ -90,6 +90,7 @@ def set_logging(name=None, verbose=VERBOSE):
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))
     handler.setLevel(level)
+    log.handlers.clear()
     log.addHandler(handler)
 
 

@@ -21,18 +21,21 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from utils.loggers.misc import AverageMeter
 
+import horovod.torch as hvd
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import yaml
+# from nni.compression.pytorch.pruning import L1NormPruner
+# from nni.algorithms.compression.v2.pytorch.pruning import L1NormPruner
+from nni.algorithms.compression.pytorch.pruning import L1FilterPruner
+from nni.compression.pytorch.speedup import ModelSpeedup
 from torch.cuda import amp
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
-import horovod.torch as hvd
 from tqdm import tqdm
+
+from utils.loggers.misc import AverageMeter
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -42,22 +45,23 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import val  # for end-of-epoch mAP
 from models.experimental import attempt_load
-from models.yolo import Model
+from models.yolo import Model, Detect
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader
+from utils.dataloaders import create_dataloader, metric_reduce
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
-                           intersect_dicts, is_ascii, labels_to_class_weights, labels_to_image_weights, methods,
-                           one_cycle, print_args, print_mutation, strip_optimizer)
+                           intersect_dicts, labels_to_class_weights, labels_to_image_weights, methods,
+                           one_cycle, print_args, print_mutation, strip_optimizer, set_logging)
 from utils.loggers import Loggers
 from utils.loggers.wandb.wandb_utils import check_wandb_resume
 from utils.loss import ComputeLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
-from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
+from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first, \
+    model_info
 
 hvd.init()  # use horovod rank
 LOCAL_RANK = hvd.local_rank() if hvd.size() != 1 else -1
@@ -77,6 +81,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
     callbacks.run('on_pretrain_routine_start')
+    # nni create new logging handler reset
+    set_logging()
 
     # Directories
     if RANK in [-1, 0]:
@@ -151,6 +157,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
+    # LOGGER.info(f'imgsz:{imgsz}')
 
     # Batch size
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
@@ -162,6 +169,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
     LOGGER.info(f"Scaled weight_decay = {hyp['weight_decay']}")
+
+    # Print Module
+    LOGGER.info(f'Begin Print Moduel for prune')
+    LOGGER.info(f'module:{model}')
 
     g = [], [], []  # optimizer parameter groups
     bn = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)  # normalization layers, i.e. BatchNorm2d()
@@ -320,12 +331,53 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     batch_time_start = time.time()
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
-        model.train()
 
         train_forward_time = AverageMeter("ForwardTime", ":6.3f")
         train_backward_time = AverageMeter("BackwardTime", ":6.3f")
         train_opt_time = AverageMeter("OptTime", ":6.3f")
         train_batch_time = AverageMeter("BatchTime", ":6.3f")
+        train_epoch_time = AverageMeter("EpochTime", ":6.3f")
+        epoch_time_start = time.time()
+
+        if opt.pruning:
+            # if opt.pruning and epoch == hyp['warmup_epochs']:
+            LOGGER.info(f'Begin to prune')
+            mask_path = f'{save_dir}/{opt.name}_mask.pth'
+            model_path = f'{save_dir}/{opt.name}_pruned.pth'
+            dummy_input = torch.randn([batch_size, 3, 640, 640]).to(device)
+            if RANK in [-1, 0]:
+                config_list = [{
+                    'op_names': ['model.24.m.0', 'model.24.m.1', 'model.24.m.2'],
+                    'exclude': True
+                },
+                    {
+                        'sparsity': opt.sparsity,
+                        'op_types': ['Conv2d'],
+                        'op_names': [
+                            'model.0.conv',
+                            'model.1.conv',
+                            'model.2.cv1.conv',
+                            'model.2.cv2.conv',
+                            'model.2.cv3.conv',
+                            'model.2.m.0.cv1.conv',
+                            'model.2.m.0.cv2.conv']
+                    }]
+                pruner = L1FilterPruner(model, config_list, dummy_input=dummy_input, dependency_aware=True)
+                pruned_model = pruner.compress()
+                pruner.export_model(model_path=model_path, mask_path=mask_path)
+                pruner._unwrap_model()
+            # waiting for pruning
+            metric_reduce([0], name="Barrier")
+            # Actual speed up
+            # for k, m in model.named_modules():
+            #     if isinstance(m, Detect):
+            #         m.grid = [torch.zeros(1)] * m.nl
+
+            m_speedup = ModelSpeedup(model, dummy_input=dummy_input, masks_file=mask_path)
+            m_speedup.speedup_model()
+            # Print model
+            model_info(model, img_size=imgsz)
+        model.train()
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -416,6 +468,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
 
+        train_epoch_time.update(time.time() - epoch_time_start)
+
         if RANK in (-1, 0):
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
@@ -438,7 +492,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if fi > best_fitness:
                 best_fitness = fi
             train_times = [train_forward_time.value(), train_backward_time.value(), train_opt_time.value(),
-                           train_batch_time.value()]
+                           train_batch_time.value(), train_epoch_time.value()]
             log_vals = list(mloss) + list(results) + lr + train_times
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 

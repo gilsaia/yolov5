@@ -94,6 +94,12 @@ def exif_transpose(image):
     return image
 
 
+def metric_reduce(val, name):
+    tensor = torch.as_tensor(val)
+    reduced_tensor = hvd.allreduce(tensor, name=name)
+    return reduced_tensor.tolist()
+
+
 def create_dataloader(path,
                       imgsz,
                       batch_size,
